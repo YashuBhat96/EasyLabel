@@ -364,8 +364,10 @@ class Labeler(tk.Tk):
     def load_image(self, i):
         if not (0 <= i < len(self.images)):
             return
-        # auto-save current before leaving (if enabled)
-        if self.index >= 0 and self.boxes and self.autosave.get():
+        # auto-save current before leaving (if enabled).
+        # Save regardless of whether boxes exist, so deletions / emptied images
+        # are persisted too. Triggered by next, prev, AND file-list clicks.
+        if self.index >= 0 and self.autosave.get():
             self.save(silent=True)
 
         prev_boxes = [b.copy() for b in self.boxes]
