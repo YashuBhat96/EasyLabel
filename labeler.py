@@ -13,6 +13,9 @@ Features
   until you edit them.
 - Copy / paste boxes across images (Ctrl+C / Ctrl+V). If exactly one box is
   selected, Ctrl+C copies only that box; otherwise it copies all of them.
+  The copy buffer PERSISTS — copy once, then paste as many times and across
+  as many images as you like; it only changes when you copy again. Repeated
+  pastes onto the same image are nudged slightly so they don't stack unseen.
 - Drawing always wins over a bigger box: dragging with a label set creates a
   new box even on top of a larger one. Click a box once to select it, then
   drag its interior to move (or grab a corner to resize). Esc deselects.
@@ -63,18 +66,19 @@ def color_for(label, labels):
 
 class Box:
     """A bounding box in IMAGE pixel coordinates."""
-    __slots__ = ("x1", "y1", "x2", "y2", "label")
+    __slots__ = ("x1", "y1", "x2", "y2", "label", "group")
 
-    def __init__(self, x1, y1, x2, y2, label):
+    def __init__(self, x1, y1, x2, y2, label, group=None):
         self.x1, self.y1, self.x2, self.y2 = x1, y1, x2, y2
         self.label = label
+        self.group = group          # shared int id -> grouped; None -> standalone
 
     def norm(self):
         return (min(self.x1, self.x2), min(self.y1, self.y2),
                 max(self.x1, self.x2), max(self.y1, self.y2))
 
     def copy(self):
-        return Box(self.x1, self.y1, self.x2, self.y2, self.label)
+        return Box(self.x1, self.y1, self.x2, self.y2, self.label, self.group)
 
 
 class Labeler(tk.Tk):
@@ -86,6 +90,7 @@ class Labeler(tk.Tk):
         # state
         self.input_dir = ""
         self.output_dir = ""
+        self.output_explicit = False  # True once user picks a distinct output
         self.compare_dir = ""
         self.images = []
         self.index = -1
@@ -105,16 +110,22 @@ class Labeler(tk.Tk):
         self.fmt = tk.StringVar(value="YOLO")
         self.carry = tk.BooleanVar(value=False)  # default: no auto-copy of boxes
         self.autosave = tk.BooleanVar(value=True)  # save on image change
-        self.clipboard = []         # copied boxes
+        self.clipboard = []         # copied boxes — PERSISTS until you copy again
+        self.paste_count = 0        # how many times pasted onto the current image
+        self.paste_last_index = None
         self.annotated = set()      # image names that have been saved
 
         # interaction
         self.action = None          # 'draw' | 'move' | 'resize'
-        self.sel = None             # selected box index
+        self.sel = None             # primary selected box index (for handles)
+        self.selected = set()       # ALL selected box indices (multi-select)
+        self._next_group = 1        # next group id to hand out
+        self.mouse_img = None       # last cursor position in image coords
         self.handle = None          # which handle when resizing
         self.start = (0, 0)
         self.temp = None
         self._pending_box = None    # box under an undecided press (click vs drag)
+        self._pending_shift = False
         self._press_screen = (0, 0) # screen point where the press began
 
         self._load_config()
@@ -171,9 +182,12 @@ class Labeler(tk.Tk):
         # grab keyboard focus when the pointer is over the canvas, so the
         # space/arrow pan shortcuts always reach it
         self.canvas.bind("<Enter>", lambda e: self.canvas.focus_set())
-        self.canvas.bind("<ButtonPress-1>", self.on_down)
+        self.canvas.bind("<ButtonPress-1>", lambda e: self.on_down(e, False))
+        self.canvas.bind("<Shift-ButtonPress-1>", lambda e: self.on_down(e, True))
         self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<Shift-B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_up)
+        self.canvas.bind("<Shift-ButtonRelease-1>", self.on_up)
         self.canvas.bind("<Configure>", self.on_resize)
         self.canvas.bind("<Motion>", self.on_hover)
         # scroll: plain = pan, Cmd/Ctrl = zoom (Win/Mac); Button-4/5 = Linux vert
@@ -213,7 +227,7 @@ class Labeler(tk.Tk):
         ttk.Separator(right).pack(fill="x", pady=6)
         ttk.Label(right, text="Boxes in this image:").pack(anchor="w")
         self.box_list = tk.Listbox(right, height=14, exportselection=False,
-                                   activestyle="none",
+                                   activestyle="none", selectmode="extended",
                                    selectbackground="#2d6cdf",
                                    selectforeground="white")
         self.box_list.pack(fill="both", expand=False)
@@ -268,6 +282,12 @@ class Labeler(tk.Tk):
         self.bind("<Command-c>", lambda e: self.copy_boxes())
         self.bind("<Command-v>", lambda e: self.paste_boxes())
         self.bind("<Command-0>", lambda e: self.zoom_reset())
+        # group / ungroup the current multi-selection (Cmd/Ctrl+G toggles)
+        self.bind("<Control-g>", self._nav(self.toggle_group))
+        self.bind("<Command-g>", self._nav(self.toggle_group))
+        for seq in ("<Control-Shift-G>", "<Control-Shift-g>",
+                    "<Command-Shift-G>", "<Command-Shift-g>"):
+            self.bind(seq, self._nav(self.ungroup_selected))
         self.bind("<Delete>", lambda e: self.delete_box())
         self.bind("<BackSpace>", self._nav(self.delete_box))
         self.bind("<Escape>", lambda e: self.deselect())
@@ -290,10 +310,12 @@ class Labeler(tk.Tk):
         if not d:
             return
         self.input_dir = d
-        # default output to the same folder as input (LabelImg-style).
-        # User can still override afterwards via "Output Folder".
-        self.output_dir = d
-        self.output_lbl.config(text="Output: " + d)
+        # default output to the same folder as input (LabelImg-style) — but only
+        # if the user hasn't explicitly chosen a separate output folder. This is
+        # what previously made the output stick to input no matter what.
+        if not self.output_explicit:
+            self.output_dir = d
+            self.output_lbl.config(text="Output: " + d)
         # --- fresh start: never carry classes/boxes from a previous folder ---
         self.index = -1
         self.label_history = []
@@ -301,6 +323,7 @@ class Labeler(tk.Tk):
         self.clipboard = []
         self.boxes = []
         self.sel = None
+        self.selected = set()
         # adopt only the classes that already belong to THIS folder, if any
         self._load_classes_file(self.output_dir)
         self.label_box.config(values=self.label_history)
@@ -322,6 +345,7 @@ class Labeler(tk.Tk):
                                     initialdir=start)
         if d:
             self.output_dir = d
+            self.output_explicit = True
             self.output_lbl.config(text="Output: " + d)
             self._scan_annotated()
             self.redraw()
@@ -386,6 +410,8 @@ class Labeler(tk.Tk):
         self.file_list.selection_set(i)
         self.file_list.see(i)
         self.sel = None
+        self.selected = set()
+        self.mouse_img = None       # so a paste before hovering uses copied pos
         self.fit()
         self.refresh_box_list()
         self.redraw()
@@ -657,13 +683,20 @@ class Labeler(tk.Tk):
             sx1, sy1 = self.to_screen(x1, y1)
             sx2, sy2 = self.to_screen(x2, y2)
             col = color_for(b.label, self.label_history)
-            w = 3 if i == self.sel else 2
-            self.canvas.create_rectangle(sx1, sy1, sx2, sy2, outline=col, width=w)
-            self.canvas.create_rectangle(sx1, sy1 - 16, sx1 + 8 + 7 * len(b.label), sy1,
+            sel = i in self.selected
+            w = 3 if sel else 2
+            dash = (3, 2) if b.group is not None else ()
+            self.canvas.create_rectangle(sx1, sy1, sx2, sy2, outline=col, width=w,
+                                         dash=dash)
+            tag = "▣ " if b.group is not None else ""
+            txt = tag + b.label
+            self.canvas.create_rectangle(sx1, sy1 - 16, sx1 + 8 + 7 * len(txt), sy1,
                                          fill=col, outline=col)
-            self.canvas.create_text(sx1 + 3, sy1 - 8, anchor="w", text=b.label,
+            self.canvas.create_text(sx1 + 3, sy1 - 8, anchor="w", text=txt,
                                     fill="white", font=("TkDefaultFont", 9, "bold"))
-            if i == self.sel:
+            # corner squares on every selected box (resize handles when it's the
+            # only selection; selection indicators when several are selected)
+            if sel:
                 for hx, hy in ((sx1, sy1), (sx2, sy1), (sx1, sy2), (sx2, sy2)):
                     self.canvas.create_rectangle(hx - HANDLE, hy - HANDLE,
                                                  hx + HANDLE, hy + HANDLE,
@@ -700,7 +733,7 @@ class Labeler(tk.Tk):
                                         anchor="w", text=b.label, fill="#3cf")
 
     # ---------------- mouse ----------------
-    def on_down(self, e):
+    def on_down(self, e, shift=False):
         if not self.img:
             return
         if self.space_held or self.pan_mode.get():   # hand tool = pan
@@ -714,22 +747,26 @@ class Labeler(tk.Tk):
         # so it stops "editing itself" and a/d/arrows act as shortcuts again
         self.canvas.focus_set()
         ix, iy = self.to_image(e.x, e.y)
+        self.mouse_img = (ix, iy)
         self.start = (ix, iy)
         self._press_screen = (e.x, e.y)
-        # 1) grab a resize handle of the currently selected box
-        if self.sel is not None:
+        self._pending_shift = shift or bool(e.state & 0x0001)   # Shift held?
+        # 1) grab a resize handle — only when exactly one box is selected
+        if (self.sel is not None and len(self.selected) <= 1
+                and not self._pending_shift):
             h = self._hit_handle(e.x, e.y, self.boxes[self.sel])
             if h:
                 self.action, self.handle = "resize", h
                 return
-        # 2) dragging *inside the already-selected box* moves it
-        if self.sel is not None and self._inside(self.sel, ix, iy):
+        # 2) dragging inside ANY selected box moves the whole selection
+        if (not self._pending_shift and self.selected
+                and any(self._inside(i, ix, iy) for i in self.selected)):
             self.action = "move"
             return
         # 3) otherwise undecided until we see motion (resolved in on_drag):
         #      drag + a label set  -> draw a NEW box (even over a bigger one)
         #      drag + no label     -> move the box under the cursor
-        #      click, no drag      -> select that box, or deselect on empty space
+        #      click, no drag      -> select that box (Shift toggles), or deselect
         self.action = "pending"
         self._pending_box = self._box_at(ix, iy)
 
@@ -755,12 +792,14 @@ class Labeler(tk.Tk):
             mvy = e.y - self._press_screen[1]
             if (mvx * mvx + mvy * mvy) ** 0.5 < 3:
                 return                       # still a click, keep waiting
+            if self._pending_shift:
+                return                       # Shift is for click-toggle only
             if self.current_label:
-                self.sel = None              # drawing wins, even over a big box
+                self._select_only(None)      # drawing wins, even over a big box
                 self.action = "draw"
             elif self._pending_box is not None:
-                self.sel = self._pending_box # no label -> move the grabbed box
-                self.refresh_box_list(select=self.sel)
+                self._select_only(self._pending_box)  # no label -> move it
+                self.refresh_box_list()
                 self.action = "move"
             else:
                 self.action = None
@@ -773,13 +812,20 @@ class Labeler(tk.Tk):
             self.redraw()
         elif self.action == "move":
             dx, dy = ix - self.start[0], iy - self.start[1]
-            b = self.boxes[self.sel]
             W, H = self.img.width, self.img.height
-            # limit delta so the box stays fully inside the image
-            x1, y1, x2, y2 = b.norm()
-            dx = max(-x1, min(dx, W - x2))
-            dy = max(-y1, min(dy, H - y2))
-            b.x1 += dx; b.x2 += dx; b.y1 += dy; b.y2 += dy
+            idxs = self._sel_indices()
+            if not idxs:
+                return
+            # clamp the shared delta so the WHOLE selection stays in-bounds
+            gx1 = min(self.boxes[i].norm()[0] for i in idxs)
+            gy1 = min(self.boxes[i].norm()[1] for i in idxs)
+            gx2 = max(self.boxes[i].norm()[2] for i in idxs)
+            gy2 = max(self.boxes[i].norm()[3] for i in idxs)
+            dx = max(-gx1, min(dx, W - gx2))
+            dy = max(-gy1, min(dy, H - gy2))
+            for i in idxs:
+                b = self.boxes[i]
+                b.x1 += dx; b.x2 += dx; b.y1 += dy; b.y2 += dy
             self.start = (ix, iy)
             self.redraw()
         elif self.action == "resize":
@@ -800,13 +846,15 @@ class Labeler(tk.Tk):
             self.canvas.config(cursor="fleur" if keep_hand else "cross")
             return
         if self.action == "pending":
-            # a plain click (no drag) -> select the box under it, else deselect
-            if self._pending_box is not None:
-                self.sel = self._pending_box
-                self.refresh_box_list(select=self.sel)
+            # a plain click (no drag): select box under it (Shift toggles it in
+            # or out of a multi-selection); empty space clears the selection
+            if self._pending_shift:
+                self._select_add(self._pending_box)
+            elif self._pending_box is not None:
+                self._select_only(self._pending_box)
             else:
-                self.sel = None
-                self.refresh_box_list()
+                self._select_only(None)
+            self.refresh_box_list()
         elif self.action == "draw" and self.temp:
             ix, iy = self.to_image(e.x, e.y)
             x1, y1 = self.start
@@ -817,8 +865,8 @@ class Labeler(tk.Tk):
                                           min(self.img.width, x2),
                                           min(self.img.height, y2))
                 self.boxes.append(b)
-                self.sel = len(self.boxes) - 1
-                self.refresh_box_list(select=self.sel)
+                self._select_only(len(self.boxes) - 1)
+                self.refresh_box_list()
         self.action = None
         self.temp = None
         self.handle = None
@@ -828,12 +876,13 @@ class Labeler(tk.Tk):
     def on_hover(self, e):
         if not self.img:
             return
+        self.mouse_img = self.to_image(e.x, e.y)   # for paste-at-cursor
         # while the hand/pan tool is active (space held, Pan checkbox, or a
         # pan in progress) always show the move cursor and never the draw cross
         if self.space_held or self.pan_mode.get() or self.panning:
             self.canvas.config(cursor="fleur")
             return
-        if self.sel is not None:
+        if self.sel is not None and len(self.selected) <= 1:
             h = self._hit_handle(e.x, e.y, self.boxes[self.sel])
             cur = {"tl": "top_left_corner", "tr": "top_right_corner",
                    "bl": "bottom_left_corner", "br": "bottom_right_corner"}.get(h)
@@ -881,7 +930,7 @@ class Labeler(tk.Tk):
     def deselect(self, e=None):
         """Clear the current selection (Escape). Lets you draw over a box
         that is currently selected, and returns focus to the canvas."""
-        self.sel = None
+        self._select_only(None)
         self.box_list.selection_clear(0, "end")
         self.canvas.focus_set()
         self.redraw()
@@ -896,77 +945,249 @@ class Labeler(tk.Tk):
             self.label_history.append(lbl)
             self.label_box.config(values=self.label_history)
             self._save_config()
-        # apply to selected box if any
-        if self.sel is not None:
-            self.boxes[self.sel].label = lbl
-            self.refresh_box_list(select=self.sel)
+        # apply to every selected box (a whole group if one is grouped)
+        for i in self._sel_indices():
+            self.boxes[i].label = lbl
+        self.refresh_box_list()
         self.redraw()
         # hand focus back to the canvas so a/d/arrows navigate again
         self.canvas.focus_set()
         return "break"
 
     def edit_box_label(self):
-        if self.sel is None:
+        idxs = self._sel_indices()
+        if not idxs:
             return
-        new = simpledialog.askstring("Edit label", "New label:",
-                                     initialvalue=self.boxes[self.sel].label)
-        if new:
-            new = new.strip()
-            self.boxes[self.sel].label = new
-            if new not in self.label_history:
-                self.label_history.append(new)
-                self.label_box.config(values=self.label_history)
-            self.current_label = new
-            self._save_config()
-            self.refresh_box_list(select=self.sel)
-            self.redraw()
+        anchor = self.sel if self.sel in idxs else min(idxs)
+        new = self._choose_label(self.boxes[anchor].label)
+        if not new:
+            return
+        for i in idxs:
+            self.boxes[i].label = new
+        if new not in self.label_history:
+            self.label_history.append(new)
+            self.label_box.config(values=self.label_history)
+        self.current_label = new
+        self._save_config()
+        self.refresh_box_list()
+        self.redraw()
 
     def delete_box(self):
-        if self.sel is not None:
-            del self.boxes[self.sel]
-            self.sel = None
-            self.refresh_box_list()
-            self.redraw()
+        if self._typing():
+            return                      # don't delete boxes while editing text
+        idxs = sorted(self._sel_indices(), reverse=True)
+        if not idxs:
+            return
+        for i in idxs:                  # delete high->low so indices stay valid
+            del self.boxes[i]
+        self._select_only(None)
+        self.refresh_box_list()
+        self.redraw()
 
     def refresh_box_list(self, select=None):
         self.box_list.delete(0, "end")
         for b in self.boxes:
             x1, y1, x2, y2 = (int(v) for v in b.norm())
-            self.box_list.insert("end", f"{b.label}  [{x1},{y1},{x2},{y2}]")
+            tag = "▣ " if b.group is not None else ""
+            self.box_list.insert("end", f"{tag}{b.label}  [{x1},{y1},{x2},{y2}]")
+        # a legacy single-select request updates the selection to that box's group
         if select is not None:
-            self.box_list.selection_clear(0, "end")
-            self.box_list.selection_set(select)
+            self._select_only(select)
+        self.box_list.selection_clear(0, "end")
+        for i in self.selected:
+            if 0 <= i < len(self.boxes):
+                self.box_list.selection_set(i)
 
     def on_select_box(self, e):
         sel = self.box_list.curselection()
         if sel:
-            self.sel = sel[0]
-            self.redraw()
+            self.selected = set(sel)
+            self.sel = sel[-1]
+        else:
+            self.selected = set()
+            self.sel = None
+        self.redraw()
+
+    # ---------------- selection & grouping ----------------
+    def _group_members(self, idx):
+        """All box indices that belong to the same group as idx (or just {idx})."""
+        if idx is None or not (0 <= idx < len(self.boxes)):
+            return set()
+        g = self.boxes[idx].group
+        if g is None:
+            return {idx}
+        return {i for i, b in enumerate(self.boxes) if b.group == g}
+
+    def _select_only(self, idx):
+        """Select box idx and its whole group; idx=None clears the selection."""
+        if idx is None:
+            self.sel = None
+            self.selected = set()
+        else:
+            self.sel = idx
+            self.selected = self._group_members(idx)
+
+    def _select_add(self, idx):
+        """Shift-click: toggle box idx (and its group) in/out of the selection."""
+        if idx is None:
+            return
+        members = self._group_members(idx)
+        if members <= self.selected:            # already selected -> remove
+            self.selected -= members
+            if self.sel in members:
+                self.sel = next(iter(self.selected), None)
+        else:                                   # add
+            self.selected |= members
+            self.sel = idx
+
+    def _sel_indices(self):
+        """The active selection as a set, falling back to the primary index."""
+        return set(self.selected) if self.selected else (
+            {self.sel} if self.sel is not None else set())
+
+    def toggle_group(self):
+        """Cmd/Ctrl+G: group the selection, or ungroup it if it's already one
+        group. Clicking any grouped box selects the whole group, so pressing
+        Cmd/Ctrl+G again on it ungroups."""
+        idxs = self._sel_indices()
+        if not idxs:
+            self.status.config(text="Select 2+ boxes (Shift-click them) then "
+                                    "Cmd/Ctrl+G to group.")
+            return
+        groups = {self.boxes[i].group for i in idxs}
+        is_one_group = (None not in groups and len(groups) == 1)
+        if is_one_group:                       # already grouped -> ungroup
+            for i in idxs:
+                self.boxes[i].group = None
+            self.status.config(text=f"Ungrouped {len(idxs)} boxes.")
+        elif len(idxs) >= 2:                   # group them
+            gid = self._next_group
+            self._next_group += 1
+            for i in idxs:
+                self.boxes[i].group = gid
+            self.status.config(text=f"Grouped {len(idxs)} boxes — they move, "
+                                    f"copy and relabel together. Press "
+                                    f"Cmd/Ctrl+G again to ungroup.")
+        else:
+            self.status.config(text="Select 2+ boxes (Shift-click them) to group.")
+            return
+        self.refresh_box_list()
+        self.redraw()
+
+    def ungroup_selected(self):
+        idxs = self._sel_indices()
+        n = 0
+        for i in idxs:
+            if self.boxes[i].group is not None:
+                self.boxes[i].group = None
+                n += 1
+        self.status.config(text=f"Ungrouped {n} box(es)." if n
+                           else "Nothing grouped in the selection.")
+        self.refresh_box_list()
+        self.redraw()
+
+    def _choose_label(self, initial=""):
+        """Modal label picker: dropdown of known classes + free text entry."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Edit label")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        ttk.Label(dlg, text="Pick a class or type your own:").pack(
+            padx=14, pady=(14, 4))
+        var = tk.StringVar(value=initial)
+        cb = ttk.Combobox(dlg, textvariable=var, values=self.label_history,
+                          width=32)
+        cb.pack(padx=14, pady=4)
+        result = {"val": None}
+
+        def ok(e=None):
+            result["val"] = var.get().strip()
+            dlg.destroy()
+
+        def cancel(e=None):
+            dlg.destroy()
+
+        bf = ttk.Frame(dlg)
+        bf.pack(pady=10)
+        ttk.Button(bf, text="OK", command=ok).pack(side="left", padx=4)
+        ttk.Button(bf, text="Cancel", command=cancel).pack(side="left", padx=4)
+        cb.bind("<Return>", ok)
+        dlg.bind("<Escape>", cancel)
+        cb.focus_set()
+        cb.selection_range(0, "end")
+        dlg.grab_set()
+        self.wait_window(dlg)
+        return result["val"]
 
     # ---------------- copy / paste ----------------
+    # The buffer persists until you copy again — copy ONCE, paste as many times
+    # and across as many images as you like. Nothing here (or in navigation)
+    # clears it, and an accidental copy on an empty image won't wipe it.
     def copy_boxes(self):
-        if self.sel is not None:
-            self.clipboard = [self.boxes[self.sel].copy()]
-            self.status.config(text="Copied 1 selected box — switch image and "
-                                    "press Ctrl/Cmd+V to paste just that box.")
+        idxs = sorted(self.selected) if self.selected else list(range(len(self.boxes)))
+        if idxs:
+            self.clipboard = [self.boxes[i].copy() for i in idxs]
+            self.paste_count = 0
+            n = len(self.clipboard)
+            grp = " (grouped)" if any(b.group is not None for b in self.clipboard) \
+                and len({b.group for b in self.clipboard}) == 1 and n > 1 else ""
+            self.status.config(text=f"Copied {n} box(es){grp} to buffer — move the "
+                                    f"cursor where you want them and press "
+                                    f"Ctrl/Cmd+V. Buffer stays until you copy again.")
         else:
-            self.clipboard = [b.copy() for b in self.boxes]
-            self.status.config(text=f"Copied {len(self.clipboard)} box(es).")
+            held = len(self.clipboard)
+            self.status.config(text=(f"Nothing to copy here — buffer still holds "
+                                     f"{held} box(es)." if held else
+                                     "Nothing to copy (buffer empty)."))
 
     def paste_boxes(self):
         if not self.clipboard:
+            self.status.config(text="Buffer empty — select box(es) and press "
+                                    "Ctrl/Cmd+C first.")
             return
+        W, H = self.img.width, self.img.height
+        # bounding box (source coords) of the whole clipboard set
+        sx1 = min(b.norm()[0] for b in self.clipboard)
+        sy1 = min(b.norm()[1] for b in self.clipboard)
+        sx2 = max(b.norm()[2] for b in self.clipboard)
+        sy2 = max(b.norm()[3] for b in self.clipboard)
+        scx, scy = (sx1 + sx2) / 2, (sy1 + sy2) / 2
+        # target: center the set on the cursor; if the cursor isn't over the
+        # image, fall back to a small incremental offset from the copied spot
+        if self.mouse_img is not None:
+            tcx, tcy = self.mouse_img
+        else:
+            if self.paste_last_index != self.index:
+                self.paste_count = 0
+                self.paste_last_index = self.index
+            step = max(10, int(0.03 * min(W, H)))
+            tcx, tcy = scx + self.paste_count * step, scy + self.paste_count * step
+            self.paste_count += 1
+        dx, dy = tcx - scx, tcy - scy
+        # clamp so the whole pasted set stays inside the image
+        dx = max(-sx1, min(dx, W - sx2))
+        dy = max(-sy1, min(dy, H - sy2))
+        remap, new_idx = {}, []
         for b in self.clipboard:
             nb = b.copy()
-            # clamp to current image
-            nb.x1 = min(nb.x1, self.img.width); nb.x2 = min(nb.x2, self.img.width)
-            nb.y1 = min(nb.y1, self.img.height); nb.y2 = min(nb.y2, self.img.height)
+            nb.x1 += dx; nb.x2 += dx; nb.y1 += dy; nb.y2 += dy
+            if nb.group is not None:      # keep grouping, but with fresh ids
+                if nb.group not in remap:
+                    remap[nb.group] = self._next_group
+                    self._next_group += 1
+                nb.group = remap[nb.group]
             self.boxes.append(nb)
+            new_idx.append(len(self.boxes) - 1)
             if nb.label not in self.label_history:
                 self.label_history.append(nb.label)
+        self.selected = set(new_idx)      # select what we just pasted
+        self.sel = new_idx[-1]
         self.label_box.config(values=self.label_history)
         self.refresh_box_list()
         self.redraw()
+        self.status.config(text=f"Pasted {len(self.clipboard)} box(es) at cursor. "
+                                f"Buffer still holds {len(self.clipboard)} — "
+                                f"paste again anytime.")
 
     # ---------------- navigation ----------------
     def next_img(self):
@@ -1143,6 +1364,10 @@ class Labeler(tk.Tk):
             # folders never carries classes over from a previous one.
             self.input_dir = c.get("input", "")
             self.output_dir = c.get("output", "")
+            # if last session used a separate output folder, keep treating it as
+            # explicit so picking an input image folder won't reset it
+            self.output_explicit = bool(self.output_dir
+                                        and self.output_dir != self.input_dir)
         except Exception:
             pass
 
