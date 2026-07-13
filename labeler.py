@@ -34,6 +34,8 @@ Needs: Python 3.8+  and  Pillow  (pip install pillow)
 import os
 import json
 import shutil
+import threading
+from collections import OrderedDict
 import xml.etree.ElementTree as ET
 import xml.dom.minidom as minidom
 import tkinter as tk
@@ -114,6 +116,11 @@ class Labeler(tk.Tk):
         self.paste_count = 0        # how many times pasted onto the current image
         self.paste_last_index = None
         self.annotated = set()      # image names that have been saved
+        # --- navigation speed: decoded-image cache + background prefetch ---
+        self._img_cache = OrderedDict()   # path -> PIL.Image (RGB), LRU
+        self._cache_cap = 12
+        self._cache_lock = threading.Lock()
+        self._snapshot = None       # box-state at load; used to skip no-op saves
 
         # interaction
         self.action = None          # 'draw' | 'move' | 'resize'
@@ -195,6 +202,11 @@ class Labeler(tk.Tk):
         self.canvas.bind("<Shift-MouseWheel>", self.on_wheel)
         self.canvas.bind("<Button-4>", self.on_wheel)
         self.canvas.bind("<Button-5>", self.on_wheel)
+        # window-level fallback: some macOS trackpad wheels arrive at the toplevel
+        # rather than the canvas. on_wheel only acts when the pointer is over the
+        # canvas, so this won't hijack scrolling of the file/box lists.
+        self.bind("<MouseWheel>", self.on_wheel)
+        self.bind("<Shift-MouseWheel>", self.on_wheel)
         # Linux horizontal scroll buttons (not valid on macOS/Windows Tk)
         for seq in ("<Button-6>", "<Button-7>"):
             try:
@@ -217,12 +229,18 @@ class Labeler(tk.Tk):
         right.pack(side="right", fill="y")
         right.pack_propagate(False)
 
-        ttk.Label(right, text="Current label:").pack(anchor="w")
+        ttk.Label(right, text="Current label (for new boxes):").pack(anchor="w")
         self.label_box = ttk.Combobox(right, values=self.label_history)
         self.label_box.pack(fill="x")
         self.label_box.bind("<<ComboboxSelected>>", self.on_pick_label)
         self.label_box.bind("<Return>", self.on_new_label)
         ttk.Button(right, text="Set / Add label", command=self.on_new_label).pack(fill="x", pady=2)
+        # live "what am I labeling with / what's selected" indicator
+        self.cur_label_lbl = ttk.Label(right, text="Active label: (none)",
+                                       foreground="#cc0000")
+        self.cur_label_lbl.pack(anchor="w", pady=(0, 2))
+        # type-to-search: "m" -> "mou" narrows classes.txt entries live
+        self._attach_search(self.label_box, lambda: self.label_history)
 
         ttk.Separator(right).pack(fill="x", pady=6)
         ttk.Label(right, text="Boxes in this image:").pack(anchor="w")
@@ -256,6 +274,73 @@ class Labeler(tk.Tk):
         return isinstance(self.focus_get(),
                           (tk.Entry, ttk.Entry, ttk.Combobox, tk.Text))
 
+    _SKIP_KEYS = {"Return", "Escape", "Up", "Down", "Left", "Right", "Tab",
+                  "Shift_L", "Shift_R", "Control_L", "Control_R",
+                  "Meta_L", "Meta_R", "Alt_L", "Alt_R", "Super_L", "Super_R"}
+
+    def _attach_search(self, combo, source_fn):
+        """Make a ttk.Combobox filter its list as you type: 'm' -> 'mou' narrows
+        to matching classes (case-insensitive substring). Typing a brand-new
+        name still works (free text)."""
+        def on_key(e):
+            if e.keysym in self._SKIP_KEYS:
+                return
+            typed = combo.get()
+            src = list(source_fn())
+            matches = [v for v in src if typed.lower() in v.lower()] if typed else src
+            combo["values"] = matches if matches else src
+            if typed and matches:
+                try:                              # live-open the filtered dropdown
+                    combo.tk.call("ttk::combobox::Post", combo)
+                    combo.set(typed)              # Post may pick item 0; keep text
+                    combo.icursor("end")
+                except Exception:
+                    pass                          # filtering still works via arrow
+        combo.bind("<KeyRelease>", on_key, add="+")
+
+    def _ci(self, fn):
+        """Wrap a key handler so it still fires when Caps Lock is on (we bind the
+        uppercase keysym to the same wrapper) and warns loudly the first time."""
+        def handler(e):
+            if (e.state & 0x0002) and not getattr(self, "_caps_warned", False):
+                self._caps_warned = True
+                self.status.config(text="\u26a0 CAPS LOCK IS ON \u2014 shortcuts "
+                                        "still work, but you may want to turn it off.")
+                try:
+                    messagebox.showwarning(
+                        "Caps Lock is on",
+                        "Caps Lock is ON.\n\nYour shortcuts (A / D / H / S, copy, "
+                        "paste, save\u2026) still work with it on \u2014 but you may "
+                        "want to turn it off.")
+                except Exception:
+                    pass
+            return fn(e)
+        return handler
+
+    def _bind_ci(self, letter, fn, mods=("",)):
+        """Bind fn to <mod+letter> in BOTH lower- and upper-case keysyms (so it
+        works with Caps Lock) across each modifier prefix in `mods`."""
+        wrapped = self._ci(fn)
+        for m in mods:
+            self.bind(f"<{m}{letter.lower()}>", wrapped)
+            self.bind(f"<{m}{letter.upper()}>", wrapped)
+
+    def _update_cur_label(self):
+        """Show what new boxes get labeled, or the selected box's label."""
+        if not hasattr(self, "cur_label_lbl"):
+            return
+        n = len(self.selected)
+        if n == 1:
+            i = next(iter(self.selected))
+            self.cur_label_lbl.config(text=f"Selected box: {self.boxes[i].label}")
+        elif n > 1:
+            labs = {self.boxes[i].label for i in self.selected}
+            txt = next(iter(labs)) if len(labs) == 1 else f"{len(labs)} different"
+            self.cur_label_lbl.config(text=f"{n} selected \u2192 {txt}")
+        else:
+            self.cur_label_lbl.config(
+                text=f"Active label: {self.current_label or '(none)'}")
+
     def _nav(self, fn):
         """Wrap a shortcut so it's ignored while typing in a text field."""
         def handler(e):
@@ -266,34 +351,32 @@ class Labeler(tk.Tk):
         return handler
 
     def _bind_keys(self):
-        self.bind("<a>", self._nav(self.prev_img))
-        self.bind("<d>", self._nav(self.next_img))
+        self._caps_warned = False
+        # image nav — A / D, plain AND Ctrl/Cmd, upper/lower (Caps-Lock-proof)
+        self._bind_ci("a", self._nav(self.prev_img), mods=("", "Control-", "Command-"))
+        self._bind_ci("d", self._nav(self.next_img), mods=("", "Control-", "Command-"))
         self.bind("<Left>", self._nav(lambda: self.arrow(-1, 0)))
         self.bind("<Right>", self._nav(lambda: self.arrow(1, 0)))
         self.bind("<Up>", self._nav(lambda: self.arrow(0, -1)))
         self.bind("<Down>", self._nav(lambda: self.arrow(0, 1)))
         self.bind("<KeyPress-space>", self.on_space_down)
         self.bind("<KeyRelease-space>", self.on_space_up)
-        self.bind("<Control-s>", lambda e: self.save())
-        self.bind("<Control-c>", lambda e: self.copy_boxes())
-        self.bind("<Control-v>", lambda e: self.paste_boxes())
-        # macOS Command-key equivalents
-        self.bind("<Command-s>", lambda e: self.save())
-        self.bind("<Command-c>", lambda e: self.copy_boxes())
-        self.bind("<Command-v>", lambda e: self.paste_boxes())
+        # save / copy / paste — Ctrl+Cmd, upper/lower (Caps-Lock-proof)
+        self._bind_ci("s", lambda e: self.save(), mods=("Control-", "Command-"))
+        self._bind_ci("c", lambda e: self.copy_boxes(), mods=("Control-", "Command-"))
+        self._bind_ci("v", lambda e: self.paste_boxes(), mods=("Control-", "Command-"))
         self.bind("<Command-0>", lambda e: self.zoom_reset())
-        # group / ungroup the current multi-selection (Cmd/Ctrl+G toggles)
-        self.bind("<Control-g>", self._nav(self.toggle_group))
-        self.bind("<Command-g>", self._nav(self.toggle_group))
+        # group / ungroup (Cmd/Ctrl+G toggles) — Caps-Lock-proof
+        self._bind_ci("g", self._nav(self.toggle_group), mods=("Control-", "Command-"))
         for seq in ("<Control-Shift-G>", "<Control-Shift-g>",
                     "<Command-Shift-G>", "<Command-Shift-g>"):
             self.bind(seq, self._nav(self.ungroup_selected))
         self.bind("<Delete>", lambda e: self.delete_box())
         self.bind("<BackSpace>", self._nav(self.delete_box))
         self.bind("<Escape>", lambda e: self.deselect())
-        # w = create a new label (jump to the label box, ready to type)
-        self.bind("<w>", self.focus_new_label)
-        self.bind("<h>", self.toggle_pan_mode)
+        # W = jump to label box to type a new label; H = toggle pan/hand tool
+        self._bind_ci("w", self.focus_new_label, mods=("",))
+        self._bind_ci("h", self.toggle_pan_mode, mods=("", "Control-", "Command-"))
         # zoom keys: + / = zoom in, - zoom out, Ctrl+0 reset
         self.bind("<plus>", self._nav(self.zoom_in))
         self.bind("<KP_Add>", self._nav(self.zoom_in))
@@ -385,6 +468,59 @@ class Labeler(tk.Tk):
             self.file_list.selection_set(self.index)
             self.file_list.see(self.index)
 
+    def _mark_one(self, i):
+        """Update just ONE file-list row's ●/space mark (fast — avoids the
+        full-list rebuild on every image switch, which is the main nav lag)."""
+        if not (0 <= i < len(self.images)):
+            return
+        f = self.images[i]
+        stem = os.path.splitext(f)[0]
+        mark = "● " if stem in self.annotated else "   "
+        try:
+            sel = i in self.file_list.curselection()
+            self.file_list.delete(i)
+            self.file_list.insert(i, mark + f)
+            if sel:
+                self.file_list.selection_set(i)
+        except Exception:
+            pass
+
+    # ---- decoded-image cache + prefetch (fast back/forward navigation) ----
+    def _decode(self, path):
+        with self._cache_lock:
+            im = self._img_cache.get(path)
+            if im is not None:
+                self._img_cache.move_to_end(path)
+                return im
+        im = Image.open(path).convert("RGB")
+        with self._cache_lock:
+            self._img_cache[path] = im
+            self._img_cache.move_to_end(path)
+            while len(self._img_cache) > self._cache_cap:
+                self._img_cache.popitem(last=False)
+        return im
+
+    def _prefetch(self, indices):
+        """Decode neighbour images in the background so the next switch is instant."""
+        def work():
+            for j in indices:
+                if 0 <= j < len(self.images):
+                    p = os.path.join(self.input_dir, self.images[j])
+                    with self._cache_lock:
+                        have = p in self._img_cache
+                    if not have:
+                        try:
+                            self._decode(p)
+                        except Exception:
+                            pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def _box_state(self):
+        """Cheap fingerprint of the current labels; used to skip no-op saves."""
+        return (tuple((round(b.x1, 2), round(b.y1, 2), round(b.x2, 2),
+                       round(b.y2, 2), b.label, b.group) for b in self.boxes),
+                tuple(self.label_history))
+
     def load_image(self, i):
         if not (0 <= i < len(self.images)):
             return
@@ -397,7 +533,7 @@ class Labeler(tk.Tk):
         prev_boxes = [b.copy() for b in self.boxes]
         self.index = i
         path = os.path.join(self.input_dir, self.images[i])
-        self.img = Image.open(path).convert("RGB")
+        self.img = self._decode(path)          # cached decode (fast on revisit)
         self.boxes = []
 
         # try to load existing labels
@@ -406,6 +542,7 @@ class Labeler(tk.Tk):
             # carry over boxes from previous image
             self.boxes = [b.copy() for b in prev_boxes]
 
+        self._snapshot = self._box_state()     # baseline to detect real edits
         self.file_list.selection_clear(0, "end")
         self.file_list.selection_set(i)
         self.file_list.see(i)
@@ -417,6 +554,7 @@ class Labeler(tk.Tk):
         self.redraw()
         self.status.config(text=f"{self.images[i]}  ({i+1}/{len(self.images)})  "
                                  f"{self.img.width}x{self.img.height}")
+        self._prefetch([i + 1, i + 2, i - 1])  # warm neighbours in background
 
     def fit(self):
         """Reset view: fit whole image to canvas and clear zoom/pan."""
@@ -485,25 +623,34 @@ class Labeler(tk.Tk):
     def on_wheel(self, e):
         """Trackpad two-finger scroll / mouse wheel.
 
-        Plain scroll  -> PAN the image (natural on a Mac trackpad).
-        Cmd/Ctrl+scroll, or pinch -> ZOOM about the cursor.
+        Plain scroll / pinch -> PAN the image (natural on a Mac trackpad).
+        Cmd/Ctrl + scroll    -> ZOOM about the pointer.
         Linux/X11 sends Button-4/5 instead of <MouseWheel>.
         """
         if not self.img:
             return
-        # state mask: 0x4 = Control, 0x8/0x10 = Alt, 0x40000/0x8 = Command on mac
+        # only act when the pointer is over the image canvas, so wheel-scrolling
+        # the file/box lists still scrolls them instead of moving the image
+        px = self.canvas.winfo_pointerx() - self.canvas.winfo_rootx()
+        py = self.canvas.winfo_pointery() - self.canvas.winfo_rooty()
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if not (0 <= px <= cw and 0 <= py <= ch):
+            return                      # let the widget under the pointer handle it
         mod = bool(e.state & 0x4) or bool(e.state & 0x40000) or bool(e.state & 0x8)
-        if getattr(e, "num", None) == 4:
+        num = getattr(e, "num", None)
+        if num == 4:
             delta = 1
-        elif getattr(e, "num", None) == 5:
+        elif num == 5:
             delta = -1
         else:
-            delta = 1 if e.delta > 0 else -1
+            d = getattr(e, "delta", 0)
+            if not d:
+                return "break"          # ignore zero-delta noise
+            delta = 1 if d > 0 else -1
 
-        if mod:  # zoom
-            factor = 1.15 ** delta
-            self.set_zoom(self.zoom * factor, anchor=(e.x, e.y))
-        else:    # pan vertically (shift+scroll pans horizontally)
+        if mod:                              # ZOOM about the pointer (Ctrl/Cmd+scroll)
+            self.set_zoom(self.zoom * (1.15 ** delta), anchor=(px, py))
+        else:                                # PAN
             step = 60 * delta
             if e.state & 0x1:  # Shift -> horizontal
                 self.offx += step
@@ -511,6 +658,7 @@ class Labeler(tk.Tk):
                 self.offy += step
             self._clamp_pan()
             self.redraw()
+        return "break"
 
     def on_hscroll(self, e):
         """Horizontal two-finger swipe on trackpads that emit Shift-MouseWheel
@@ -704,6 +852,7 @@ class Labeler(tk.Tk):
         if self.temp:
             self.canvas.create_rectangle(*self.temp, outline="#ffff00", width=2, dash=(4, 3))
         self._draw_compare()
+        self._update_cur_label()
 
     def _draw_compare(self):
         if not self.compare_dir or not self.img:
@@ -959,7 +1108,7 @@ class Labeler(tk.Tk):
         if not idxs:
             return
         anchor = self.sel if self.sel in idxs else min(idxs)
-        new = self._choose_label(self.boxes[anchor].label)
+        new = self._choose_label(self.boxes[anchor].label, count=len(idxs))
         if not new:
             return
         for i in idxs:
@@ -1086,18 +1235,24 @@ class Labeler(tk.Tk):
         self.refresh_box_list()
         self.redraw()
 
-    def _choose_label(self, initial=""):
-        """Modal label picker: dropdown of known classes + free text entry."""
+    def _choose_label(self, initial="", count=1):
+        """Modal label picker: searchable dropdown of known classes + free text,
+        and a display of the label currently set on the box(es) being edited."""
         dlg = tk.Toplevel(self)
         dlg.title("Edit label")
         dlg.transient(self)
         dlg.resizable(False, False)
-        ttk.Label(dlg, text="Pick a class or type your own:").pack(
-            padx=14, pady=(14, 4))
+        head = f"Editing {count} boxes" if count > 1 else "Editing 1 box"
+        ttk.Label(dlg, text=head).pack(padx=14, pady=(14, 2))
+        ttk.Label(dlg, text=f"Currently labeled: {initial or '(none)'}",
+                  foreground="#cc0000").pack(padx=14, pady=(0, 6))
+        ttk.Label(dlg, text="Type to search classes, or enter a new label:").pack(
+            padx=14, pady=(0, 4))
         var = tk.StringVar(value=initial)
         cb = ttk.Combobox(dlg, textvariable=var, values=self.label_history,
                           width=32)
         cb.pack(padx=14, pady=4)
+        self._attach_search(cb, lambda: self.label_history)   # type-to-search
         result = {"val": None}
 
         def ok(e=None):
@@ -1213,6 +1368,11 @@ class Labeler(tk.Tk):
             if not silent:
                 messagebox.showinfo("Save", "Pick an output folder first.")
             return
+        # Skip silent (autosave) writes when nothing changed since load — this is
+        # the big win when just browsing on a network volume: no disk write per
+        # image switch. Explicit saves (Ctrl+S) always write.
+        if silent and self._snapshot is not None and self._box_state() == self._snapshot:
+            return
         os.makedirs(self.output_dir, exist_ok=True)
         stem = os.path.splitext(self.images[self.index])[0]
         if self.fmt.get() == "YOLO":
@@ -1220,7 +1380,8 @@ class Labeler(tk.Tk):
         else:
             self._save_voc(stem)
         self.annotated.add(stem)
-        self._refresh_file_marks()
+        self._mark_one(self.index)          # fast: update only this row's mark
+        self._snapshot = self._box_state()  # new baseline
         if not silent:
             self.status.config(text=f"Saved {stem} ({self.fmt.get()})")
 
